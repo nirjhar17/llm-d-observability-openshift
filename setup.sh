@@ -143,7 +143,11 @@ if [ "$HAS_DASHBOARD_JSON" = true ]; then
         oc delete configmap vllm-latency-throughput-and-cache-json -n "$NAMESPACE"
     fi
 
+    # Two replacements:
+    # 1. ${DS_PROMETHEUS} -> prometheus  (datasource UID)
+    # 2. vllm: -> kserve_vllm:          (RHOAI uses kserve_ prefix for vLLM metrics)
     sed 's/${DS_PROMETHEUS}/prometheus/g' "$DASHBOARD_JSON_PATH" | \
+        sed 's/vllm:/kserve_vllm:/g' | \
         oc create configmap vllm-latency-throughput-and-cache-json \
         --from-file=dashboard.json=/dev/stdin \
         -n "$NAMESPACE"

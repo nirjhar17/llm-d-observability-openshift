@@ -173,6 +173,7 @@ This is a two-part step because Sally's dashboard JSON uses a `${DS_PROMETHEUS}`
 cd /path/to/llm-d-deployer/quickstart/grafana/dashboards
 
 sed 's/${DS_PROMETHEUS}/prometheus/g' llm-d-dashboard.json | \
+  sed 's/vllm:/kserve_vllm:/g' | \
   oc create configmap vllm-latency-throughput-and-cache-json \
   --from-file=dashboard.json=/dev/stdin \
   -n llm-d-monitoring
@@ -181,7 +182,12 @@ sed 's/${DS_PROMETHEUS}/prometheus/g' llm-d-dashboard.json | \
 What this does:
 - Reads `llm-d-dashboard.json` (the real file)
 - Replaces `${DS_PROMETHEUS}` with `prometheus` (your datasource UID)
+- Replaces `vllm:` with `kserve_vllm:` (RHOAI prefixes all vLLM metrics with `kserve_`)
 - Creates a ConfigMap with the fixed JSON under the key `dashboard.json`
+
+> **Why the metric prefix fix?** Sally's original dashboard uses `vllm:` (standard vLLM metrics).
+> But on RHOAI/OpenShift AI, the ServiceMonitor adds a `kserve_` prefix, so all metrics
+> become `kserve_vllm:`. Without this fix, the dashboard shows "No data".
 
 **7b: Create the GrafanaDashboard CR:**
 
