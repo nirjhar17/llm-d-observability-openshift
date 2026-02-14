@@ -1,12 +1,14 @@
-# llm-d: How Your Model Gets Requests (and How We Fixed It)
+# llm-d: The Full Picture -- From Installing RHOAI to Serving Your Model
 
-> This guide explains how requests reach your LLM on OpenShift AI,
-> what every piece does in plain English, and documents the bug we found and fixed.
+> This guide explains the ENTIRE journey: what happens when you install
+> OpenShift AI, what gets created at each step, how requests reach your LLM,
+> and how all the pieces connect. Written in plain English.
 
 ---
 
 ## Table of Contents
 
+0. [The Full Journey -- From RHOAI Install to MaaS Gateway](#0-full-journey)
 1. [The Simple Version -- What Is All This Stuff?](#1-simple-version)
 2. [Your 3 Gateways -- Why Do I Have Three?](#2-your-3-gateways)
    - [Way 1: openshift-ai-inference (testing)](#way-1)
@@ -16,6 +18,354 @@
 4. [The Bug We Found and Fixed](#4-the-bug)
 5. [How to Check Each Layer (Debugging)](#5-debugging)
 6. [Copy-Paste Commands](#6-commands)
+
+---
+
+## 0. The Full Journey -- From RHOAI Install to MaaS Gateway <a name="0-full-journey"></a>
+
+This section tells the complete story. Read it top to bottom and you'll understand
+how everything connects.
+
+### Step 1: You Start with a Bare ROSA Cluster
+
+You have an OpenShift cluster on AWS (ROSA). It has:
+- 4 CPU worker nodes (`m6a.2xlarge`)
+- A GPU node pool configured in ROSA (auto-scales `g4dn.xlarge` nodes with Tesla T4 GPUs, max 2 nodes)
+- The built-in OpenShift Router (`router-default`) that gives you nice URLs like `*.apps.rosa.openshiftai3.5zpy.p3.openshiftapps.com`
+
+At this point, you can deploy regular apps but there's nothing AI-related.
+
+### Step 2: Install the NVIDIA GPU Operator
+
+**What you do**: Install "NVIDIA GPU Operator" from OperatorHub.
+
+**What it creates**:
+- Installs GPU drivers on every GPU node (compiles them for your kernel)
+- Runs a device plugin that tells Kubernetes "this node has 1 GPU available"
+- Runs DCGM exporter for GPU metrics
+- Now Kubernetes knows about GPUs and can schedule pods that request `nvidia.com/gpu`
+
+**After this step**: GPU nodes can run GPU workloads, but there's no AI platform yet.
+
+### Step 3: Install OpenShift AI (RHOAI)
+
+**What you do**: Install "Red Hat OpenShift AI" operator from OperatorHub.
+
+**What it creates** (a LOT of things, automatically):
+
+```
+RHOAI Operator (rhods-operator)
+│
+├── Installs Istio/Service Mesh 3 (OSSM3)
+│   └── Creates an Istio instance (v1.26.2)
+│       └── This is the engine that runs Envoy proxy pods
+│
+├── Creates GatewayClass: "data-science-gateway-class"
+│   └── Creates Gateway: "data-science-gateway"
+│       └── AWS creates an ELB (Load Balancer) for it
+│       └── This gateway serves: RHOAI Dashboard, Jupyter Notebooks, Pipelines
+│
+├── Creates GatewayClass: "openshift-ai-inference"
+│   └── Creates Gateway: "openshift-ai-inference"
+│       └── AWS creates ANOTHER ELB for it
+│       └── This gateway is for: model inference (your LLMs)
+│       └── NO authentication on this gateway (open to anyone with the URL)
+│
+├── Creates GatewayConfig: "default-gateway"
+│   └── Configures TLS certificates, ingress mode (LoadBalancer)
+│
+├── Installs KNative Serving (via Serverless Operator)
+├── Installs Authorino (auth engine, for later use by Kuadrant)
+├── Installs Limitador (rate limiting engine, for later use by Kuadrant)
+├── Creates the RHOAI Dashboard (in redhat-ods-applications namespace)
+└── Sets up Model Registry, Notebook Controller, etc.
+```
+
+**The key thing to understand**: At this point you already have TWO gateways and TWO AWS load balancers, even though you haven't deployed any model yet.
+
+```
+                    ┌──────────────────────────────┐
+Internet ──────────>│ ELB #1 (data-science-gateway) │──> RHOAI Dashboard, Notebooks
+                    └──────────────────────────────┘
+                    ┌──────────────────────────────┐
+Internet ──────────>│ ELB #2 (openshift-ai-inference)│──> (empty, no models yet)
+                    └──────────────────────────────┘
+```
+
+**Why are the URLs ugly ELB names?**
+Traditional OpenShift Routes go through the built-in `router-default` which has a wildcard DNS
+(`*.apps.rosa.openshiftai3...`), giving nice URLs. But these inference Gateways use the
+**Gateway API** (a newer Kubernetes standard) which creates separate LoadBalancer Services.
+Each one gets its own raw AWS ELB hostname like `aed7822c...elb.amazonaws.com`.
+In production, you'd add a DNS CNAME to give it a nice name.
+
+### Step 4: Deploy Your Model (LLMInferenceService)
+
+**What you do**: Create an `LLMInferenceService` CR for Qwen3-0.6B in namespace `my-first-model`.
+
+**What the operator creates automatically**:
+
+```
+LLMInferenceService (qwen3-0-6b)
+│
+├── Deployment: qwen3-0-6b-kserve (2 replicas)
+│   └── vLLM pods that actually run your model
+│   └── Each pod needs 1 GPU, so 2 pods = 2 GPU nodes
+│
+├── Deployment: qwen3-0-6b-kserve-router-scheduler (1 replica)
+│   └── The EPP (Endpoint Picker) -- the "smart router"
+│   └── Runs on a CPU node (doesn't need GPU)
+│   └── Listens on port 9002 (gRPC) for routing decisions
+│
+├── Service: qwen3-0-6b-kserve-workload-svc (port 8000)
+│   └── Direct access to vLLM pods (round-robin, no smart routing)
+│
+├── Service: qwen3-0-6b-epp-service (ports 9002, 9003, 9090)
+│   └── 9002 = gRPC ext-proc (Envoy talks to EPP here)
+│   └── 9003 = health checks
+│   └── 9090 = Prometheus metrics
+│
+├── InferencePool: qwen3-0-6b-inference-pool
+│   └── Groups the vLLM pods + points to the EPP service
+│   └── Istio auto-creates a headless Service for direct pod routing
+│
+├── HTTPRoute: qwen3-0-6b-kserve-route
+│   └── Attached to the "openshift-ai-inference" gateway
+│   └── Says: /my-first-model/qwen3-0-6b/v1/chat/completions → InferencePool
+│   └── Says: /my-first-model/qwen3-0-6b/v1/completions → InferencePool
+│   └── Says: /my-first-model/qwen3-0-6b/* (catch-all) → direct Service
+│
+├── DestinationRules (x2)
+│   └── TLS settings for Envoy-to-vLLM and Envoy-to-EPP connections
+│
+└── ServiceMonitor: kserve-llm-isvc-scheduler
+    └── Tells Prometheus to scrape EPP metrics on port 9090
+```
+
+**After this step**: Your model is live! You can curl it at:
+```
+https://aed7822c...elb.amazonaws.com/my-first-model/qwen3-0-6b/v1/chat/completions
+```
+
+The architecture now looks like:
+
+```
+                    ┌──────────────────────────────────┐
+Internet ──────────>│ ELB (openshift-ai-inference)      │
+                    │         ↓                         │
+                    │  Envoy (Gateway pod)              │
+                    │         ↓                         │
+                    │  ext-proc filter ──→ EPP pod      │
+                    │         ↓            (picks best  │
+                    │         ↓             vLLM pod)   │
+                    │    ┌────┴────┐                    │
+                    │    ↓         ↓                    │
+                    │ vLLM #1   vLLM #2                │
+                    │ (GPU 1)   (GPU 2)                │
+                    └──────────────────────────────────┘
+```
+
+**No auth here!** Anyone who knows the ELB URL can use your model for free.
+
+### Step 5: Set Up MaaS Gateway (You Do This Manually)
+
+**Why**: The `openshift-ai-inference` gateway has NO authentication. For production,
+you want API keys and rate limiting. That's what the MaaS (Model as a Service) setup gives you.
+
+**What you do** (following the MaaS blog post):
+
+**5a. Create the `maas-gateway`:**
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: maas-gateway
+  namespace: openshift-ingress
+  annotations:
+    opendatahub.io/managed: "false"    # <-- Tell RHOAI: "don't touch this"
+spec:
+  gatewayClassName: openshift-ai-inference   # <-- Same class as the platform gateway
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      tls:
+        certificateRefs:
+          - name: maas-gateway-tls     # <-- Your TLS cert
+```
+
+This creates a THIRD AWS ELB. Both `openshift-ai-inference` and `maas-gateway` use the
+same `gatewayClassName`, so they share the same Istio infrastructure underneath.
+
+**5b. Create an HTTPRoute pointing to the same model:**
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: maas-model-route
+  namespace: my-first-model
+spec:
+  parentRefs:
+    - name: maas-gateway             # <-- Attach to YOUR gateway, not the platform one
+      namespace: openshift-ingress
+  rules:
+    # Same paths, same backends as the auto-created route
+    - matches:
+        - path: {type: PathPrefix, value: /my-first-model/qwen3-0-6b/v1/chat/completions}
+      backendRefs:
+        - kind: InferencePool
+          name: qwen3-0-6b-inference-pool
+    # ... etc
+```
+
+**5c. Create Kuadrant AuthPolicy (requires API key):**
+```yaml
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: maas-gateway-auth-policy
+spec:
+  targetRef:
+    kind: Gateway
+    name: maas-gateway
+  # Configures: "You must provide a valid API key to use this gateway"
+```
+
+**5d. Create Kuadrant RateLimitPolicy (limits requests per user):**
+```yaml
+apiVersion: kuadrant.io/v1
+kind: RateLimitPolicy
+metadata:
+  name: maas-gateway-rate-limit
+spec:
+  targetRef:
+    kind: Gateway
+    name: maas-gateway
+  # Configures: "Max N requests per minute per API key"
+```
+
+**5e. Create API key tiers** (in namespaces like `tier-free`, `tier-premium`, `tier-enterprise`):
+These define different rate limits for different users.
+
+**After this step**: You now have TWO doors to the same model:
+
+```
+                   NO AUTH (for testing)                 WITH AUTH (for production)
+                   ┌─────────────────────┐               ┌─────────────────────┐
+Internet ─────────>│ openshift-ai-inference│  Internet ──>│ maas-gateway         │
+                   │ ELB: aed7822c...    │               │ ELB: a08cb63a...    │
+                   └────────┬────────────┘               └────────┬────────────┘
+                            │                                      │
+                            │         ┌───────────────┐           │
+                            └────────>│ Same Envoy    │<──────────┘
+                                      │ Same EPP      │
+                                      │ Same vLLM pods│
+                                      └───────────────┘
+```
+
+### Step 6: What We Added (Observability + Bug Fix)
+
+**6a. Grafana dashboards** (in namespace `llm-d-monitoring`):
+- Installed Grafana Operator
+- Created Grafana instance with Thanos Querier datasource
+- 2 dashboards: EPP routing metrics + vLLM performance metrics
+
+**6b. EnvoyFilter bug fix**:
+- Found that Istio 1.26.2 strips the request body when routing through EPP
+- POST requests to `/v1/chat/completions` were failing with `400 "body required"`
+- Applied an EnvoyFilter to change body mode from `FULL_DUPLEX_STREAMED` to `BUFFERED`
+- Currently only applied to `openshift-ai-inference` (not yet to `maas-gateway`)
+
+### The Complete Picture
+
+Here is EVERYTHING on your cluster and how it connects:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ YOUR ROSA CLUSTER (OCP 4.20.6, ap-southeast-1)                        │
+│                                                                         │
+│  OPERATORS INSTALLED:                                                   │
+│  ┌──────────────────┐ ┌───────────────┐ ┌───────────────┐              │
+│  │ RHOAI 3.2.0      │ │ OSSM3 3.2.1   │ │ GPU Op 25.10  │              │
+│  │ (orchestrates    │ │ (runs Istio   │ │ (GPU drivers  │              │
+│  │  everything)     │ │  v1.26.2)     │ │  + plugin)    │              │
+│  └──────────────────┘ └───────────────┘ └───────────────┘              │
+│  ┌──────────────────┐ ┌───────────────┐ ┌───────────────┐              │
+│  │ Grafana Op 5.21  │ │ Authorino     │ │ Limitador     │              │
+│  │ (dashboards)     │ │ (auth engine) │ │ (rate limits) │              │
+│  └──────────────────┘ └───────────────┘ └───────────────┘              │
+│                                                                         │
+│  NODES:                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐          │
+│  │ 4x m6a.2xlarge (CPU)    │ 2x g4dn.xlarge (GPU, T4)     │          │
+│  │ - EPP pod               │ - vLLM pod #1 (10.129.18.21)  │          │
+│  │ - Grafana               │ - vLLM pod #2 (10.131.20.20)  │          │
+│  │ - LlamaStack playground │                                │          │
+│  └──────────────────────────────────────────────────────────┘          │
+│                                                                         │
+│  3 GATEWAYS (each = its own ELB on AWS):                               │
+│                                                                         │
+│  ┌───────────────────────┐  Created by: RHOAI platform                 │
+│  │ data-science-gateway  │  For: Dashboard, Notebooks                  │
+│  │ ELB: a45138ea...      │  You don't use this for models              │
+│  └───────────────────────┘                                              │
+│                                                                         │
+│  ┌───────────────────────┐  Created by: RHOAI (via GatewayConfig)      │
+│  │ openshift-ai-inference│  For: Model inference (testing)             │
+│  │ ELB: aed7822c...      │  Auth: NONE                                │
+│  │ EnvoyFilter: APPLIED  │  HTTPRoute: auto-created by operator       │
+│  └───────────┬───────────┘                                              │
+│              │                                                          │
+│              │  ┌───────────────────────┐  Created by: YOU (MaaS blog) │
+│              │  │ maas-gateway          │  For: Model inference (prod) │
+│              │  │ ELB: a08cb63a...      │  Auth: Kuadrant (API key)    │
+│              │  │ EnvoyFilter: NOT YET  │  HTTPRoute: you created      │
+│              │  └───────────┬───────────┘                               │
+│              │              │                                           │
+│              └──────┬───────┘                                           │
+│                     │  Both gateways route to the SAME backend:        │
+│                     ▼                                                   │
+│  ┌──────────────────────────────────────────────────┐                  │
+│  │  namespace: my-first-model                        │                  │
+│  │                                                    │                  │
+│  │  InferencePool ──→ EPP (port 9002)                │                  │
+│  │       │              scores pods, picks best one   │                  │
+│  │       ▼                                            │                  │
+│  │  ┌─────────┐  ┌─────────┐                         │                  │
+│  │  │ vLLM #1 │  │ vLLM #2 │  (Qwen/Qwen3-0.6B)    │                  │
+│  │  │ GPU 1   │  │ GPU 2   │                         │                  │
+│  │  └─────────┘  └─────────┘                         │                  │
+│  └──────────────────────────────────────────────────┘                  │
+│                                                                         │
+│  MONITORING (namespace: llm-d-monitoring):                             │
+│  ┌──────────────────────────────────────────────────┐                  │
+│  │  Grafana ──→ Thanos Querier ──→ Prometheus       │                  │
+│  │  2 dashboards: EPP routing + vLLM performance    │                  │
+│  └──────────────────────────────────────────────────┘                  │
+│                                                                         │
+│  OTHER NAMESPACES:                                                     │
+│  fine-tune, guidellm-lab, lmeval-testing, nemo-evaluator,             │
+│  rag-pipeline, maas-api, tier-free/premium/enterprise                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Quick Summary: What Creates What
+
+| Step | What You Do | What Gets Created Automatically |
+|------|------------|-------------------------------|
+| 1 | Install GPU Operator | GPU drivers, device plugin on GPU nodes |
+| 2 | Install RHOAI | Istio, 2 GatewayClasses, 2 Gateways, 2 ELBs, Dashboard, KNative |
+| 3 | Create LLMInferenceService | vLLM pods, EPP pod, Services, InferencePool, HTTPRoute, DestinationRules |
+| 4 | Create maas-gateway (manual) | 3rd ELB |
+| 5 | Create HTTPRoute for maas (manual) | Route from maas-gateway to same InferencePool |
+| 6 | Create AuthPolicy (manual) | Kuadrant injects auth EnvoyFilter |
+| 7 | Create RateLimitPolicy (manual) | Kuadrant injects rate-limit EnvoyFilter |
+| 8 | Install Grafana Operator + setup | Grafana pod, datasource, dashboards |
+| 9 | Apply EnvoyFilter fix (manual) | Fixes body forwarding for EPP on Istio 1.26 |
+
+**Steps 1-3 give you a working model with no auth.**
+**Steps 4-7 add the production layer (auth + rate limiting).**
+**Steps 8-9 add observability and fix a bug.**
 
 ---
 
