@@ -1,0 +1,26 @@
+# Dashboard: vLLM Latency, Throughput, and Cache
+#
+# What it shows:
+#   - What the vLLM model server is doing internally
+#   - Latency distributions (TTFT, TPOT, E2E)
+#   - Token throughput, KV cache pressure, scheduler state
+#
+# Source: Sally O'Malley's llm-d-dashboard.json from the llm-d-deployer repo
+#         https://github.com/llm-d/llm-d-deployer/tree/main/quickstart/grafana/dashboards
+#
+# NOTE: This dashboard uses a ConfigMap because the original JSON uses a
+#       ${DS_PROMETHEUS} template variable that must be replaced with the
+#       actual datasource UID ("prometheus") before loading.
+#       The setup.sh script creates the ConfigMap automatically.
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: vllm-latency-throughput-and-cache
+  namespace: llm-d-monitoring
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: llm-d-grafana
+  configMapRef:
+    name: vllm-latency-throughput-and-cache-json
+    key: dashboard.json

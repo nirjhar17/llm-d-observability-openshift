@@ -1,0 +1,13 @@
+# Grant the ServiceAccount permission to query cluster-wide metrics via Thanos
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: grafana-thanos-cluster-monitoring-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-monitoring-view            # Built-in OpenShift role for reading metrics
+subjects:
+  - kind: ServiceAccount
+    name: grafana-thanos
+    namespace: llm-d-monitoring

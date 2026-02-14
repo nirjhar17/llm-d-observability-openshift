@@ -1,0 +1,78 @@
+# EnvoyFilter: Fix ext-proc body forwarding for InferencePool routes
+#
+# Problem: Istio 1.26.2 sets request_body_mode to FULL_DUPLEX_STREAMED for
+#          InferencePool routes, but this mode has a bug where the request
+#          body is consumed by the ext-proc filter (EPP) but NOT forwarded
+#          to the upstream vLLM pod. vLLM then returns 400 "body required".
+#
+# Fix:     Override request_body_mode from FULL_DUPLEX_STREAMED to BUFFERED.
+#          In BUFFERED mode, the entire body is sent to EPP as a single message,
+#          and then correctly forwarded to the upstream.
+#
+# Scope:   Only affects the openshift-ai-inference gateway pod.
+#          Only affects routes that use InferencePool (ext-proc).
+#
+# NOTE:    When Istio is upgraded to 1.27+ (which has native InferencePool
+#          support), this EnvoyFilter may no longer be needed and can be removed.
+#
+# To apply to the maas-gateway as well, duplicate this resource and change
+# the workloadSelector to: gateway.networking.k8s.io/gateway-name: maas-gateway
+# and update the route names to: my-first-model.maas-model-route.0 and .1
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: fix-extproc-body-mode
+  namespace: openshift-ingress
+spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: openshift-ai-inference
+  configPatches:
+  # Route: /v1/chat/completions (via InferencePool/EPP)
+  - applyTo: HTTP_ROUTE
+    match:
+      context: GATEWAY
+      routeConfiguration:
+        vhost:
+          route:
+            name: "my-first-model.qwen3-0-6b-kserve-route.1"
+    patch:
+      operation: MERGE
+      value:
+        typed_per_filter_config:
+          envoy.filters.http.ext_proc:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+            overrides:
+              processing_mode:
+                request_header_mode: SEND
+                response_header_mode: SEND
+                request_body_mode: BUFFERED
+                response_body_mode: BUFFERED
+              grpc_service:
+                envoy_grpc:
+                  cluster_name: "outbound|9002||qwen3-0-6b-epp-service.my-first-model.svc.cluster.local"
+              failure_mode_allow: true
+  # Route: /v1/completions (via InferencePool/EPP)
+  - applyTo: HTTP_ROUTE
+    match:
+      context: GATEWAY
+      routeConfiguration:
+        vhost:
+          route:
+            name: "my-first-model.qwen3-0-6b-kserve-route.0"
+    patch:
+      operation: MERGE
+      value:
+        typed_per_filter_config:
+          envoy.filters.http.ext_proc:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+            overrides:
+              processing_mode:
+                request_header_mode: SEND
+                response_header_mode: SEND
+                request_body_mode: BUFFERED
+                response_body_mode: BUFFERED
+              grpc_service:
+                envoy_grpc:
+                  cluster_name: "outbound|9002||qwen3-0-6b-epp-service.my-first-model.svc.cluster.local"
+              failure_mode_allow: true

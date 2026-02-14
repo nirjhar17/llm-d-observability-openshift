@@ -1,0 +1,28 @@
+# GrafanaDatasource pointing to Thanos Querier (federated Prometheus endpoint)
+# NOTE: The TOKEN_PLACEHOLDER must be replaced with the actual token before applying.
+#       The setup.sh script does this automatically.
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: thanos-querier
+  namespace: llm-d-monitoring
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: llm-d-grafana           # Must match the Grafana instance label
+  datasource:
+    name: Prometheus
+    type: prometheus
+    uid: prometheus                        # This UID is referenced by dashboards
+    access: proxy
+    url: https://thanos-querier.openshift-monitoring.svc:9091
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: "15s"
+      queryTimeout: "60s"
+      httpMethod: POST
+      tlsSkipVerify: true
+      httpHeaderName1: Authorization
+    secureJsonData:
+      httpHeaderValue1: "Bearer TOKEN_PLACEHOLDER"

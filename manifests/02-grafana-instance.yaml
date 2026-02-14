@@ -1,0 +1,20 @@
+apiVersion: grafana.integreatly.org/v1beta1
+kind: Grafana
+metadata:
+  name: llm-d-grafana
+  namespace: llm-d-monitoring
+  labels:
+    dashboards: llm-d-grafana            # <-- Dashboards and Datasources use this label to find this instance
+spec:
+  config:
+    auth:
+      disable_login_form: "false"
+    security:
+      admin_user: admin
+      admin_password: admin123            # <-- Change this in production!
+    log:
+      mode: console
+  route:
+    spec:
+      tls:
+        termination: edge                 # <-- Creates an OpenShift Route with HTTPS

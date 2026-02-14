@@ -1,0 +1,21 @@
+# Dashboard: EPP Routing and Pool Health
+#
+# What it shows:
+#   - How requests enter the system and how they're distributed across model pods
+#   - EPP routing decisions, error rates, pool-level health
+#   - Gateway-level latency
+#
+# Source: Upstream Gateway API Inference Extension (GIE) project
+# URL:    https://github.com/kubernetes-sigs/gateway-api-inference-extension
+#
+# The Grafana Operator fetches the JSON directly from GitHub on each resync.
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: epp-routing-and-pool-health
+  namespace: llm-d-monitoring
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: llm-d-grafana
+  url: https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/refs/heads/main/tools/dashboards/inference_gateway.json
