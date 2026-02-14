@@ -9,6 +9,9 @@
 
 1. [The Simple Version -- What Is All This Stuff?](#1-simple-version)
 2. [Your 3 Gateways -- Why Do I Have Three?](#2-your-3-gateways)
+   - [Way 1: openshift-ai-inference (testing)](#way-1)
+   - [Way 2: maas-gateway (production)](#way-2)
+   - [Way 3: Direct to vLLM (debugging)](#way-3)
 3. [How a Request Travels -- Step by Step](#3-request-flow)
 4. [The Bug We Found and Fixed](#4-the-bug)
 5. [How to Check Each Layer (Debugging)](#5-debugging)
@@ -106,12 +109,216 @@ YOUR CLUSTER
 For testing, use `openshift-ai-inference` (no auth needed, just curl it).
 For real users, use `maas-gateway` (has API key protection).
 
-### How to Find Your Gateway URLs
+### How to Access Your Model -- 3 Ways
+
+There are **3 ways** to send requests to your model. Each one has a different URL and different behavior. Here's how to find and use each one.
+
+---
+
+#### Way 1: Through `openshift-ai-inference` Gateway (easiest for testing)
+
+**What is it?** A Gateway created automatically when you deploy your model. No authentication. Anyone with the URL can use it.
+
+**How to find the URL:**
 
 ```bash
-oc get gateway -A -o custom-columns=\
-'NAME:.metadata.name,ADDRESS:.status.addresses[0].value'
+# Step 1: Get the gateway's external address (this is an AWS load balancer)
+oc get gateway openshift-ai-inference -n openshift-ingress \
+  -o jsonpath='{.status.addresses[0].value}'
 ```
+
+On our cluster, this returns:
+```
+aed7822c4ec88495fa795e5c47c2d24f-1452512295.ap-southeast-1.elb.amazonaws.com
+```
+
+**How to build the full URL:**
+
+The URL is: `https://<gateway-address>/<namespace>/<model-name>/v1/<endpoint>`
+
+On our cluster:
+- Namespace = `my-first-model` (where the LLMInferenceService lives)
+- Model name = `qwen3-0-6b` (the Kubernetes name, NOT the HuggingFace name)
+
+So the URLs are:
+
+```bash
+# Save the gateway address
+export GW=$(oc get gateway openshift-ai-inference -n openshift-ingress \
+  -o jsonpath='{.status.addresses[0].value}')
+
+# Chat completion (goes through EPP -- smart routing)
+curl -sk -X POST "https://$GW/my-first-model/qwen3-0-6b/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"Hi"}],"max_tokens":20}'
+
+# Text completion (also goes through EPP)
+curl -sk -X POST "https://$GW/my-first-model/qwen3-0-6b/v1/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3-0.6B","prompt":"Hello world","max_tokens":20}'
+
+# List models (does NOT go through EPP, goes direct to vLLM)
+curl -sk "https://$GW/my-first-model/qwen3-0-6b/v1/models"
+```
+
+**How to figure out the path prefix (`/my-first-model/qwen3-0-6b`)?**
+
+The path comes from the HTTPRoute. To see all valid paths for all gateways:
+
+```bash
+oc get httproute -A -o json | python3 -c "
+import sys, json
+for item in json.load(sys.stdin)['items']:
+    for pref in item['spec'].get('parentRefs', []):
+        gw = pref.get('name')
+        for rule in item['spec'].get('rules', []):
+            for m in rule.get('matches', []):
+                path = m.get('path', {}).get('value', '?')
+                backends = ', '.join([f\"{b.get('kind','Svc')}/{b['name']}\" for b in rule.get('backendRefs', [])])
+                print(f'  Gateway: {gw:30s} Path: {path:60s} -> {backends}')
+"
+```
+
+On our cluster, this shows:
+```
+  Gateway: openshift-ai-inference        Path: /my-first-model/qwen3-0-6b/v1/chat/completions  -> InferencePool/qwen3-0-6b-inference-pool
+  Gateway: openshift-ai-inference        Path: /my-first-model/qwen3-0-6b/v1/completions       -> InferencePool/qwen3-0-6b-inference-pool
+  Gateway: openshift-ai-inference        Path: /my-first-model/qwen3-0-6b                      -> Service/qwen3-0-6b-kserve-workload-svc
+  Gateway: maas-gateway                  Path: /my-first-model/qwen3-0-6b/v1/chat/completions  -> InferencePool/qwen3-0-6b-inference-pool
+  Gateway: maas-gateway                  Path: /my-first-model/qwen3-0-6b/v1/completions       -> InferencePool/qwen3-0-6b-inference-pool
+  Gateway: maas-gateway                  Path: /my-first-model/qwen3-0-6b                      -> Service/qwen3-0-6b-kserve-workload-svc
+```
+
+Notice: Both `openshift-ai-inference` and `maas-gateway` have the **same paths** and **same backends**. The only difference is the gateway address (different ELB URL) and authentication.
+
+---
+
+#### Way 2: Through `maas-gateway` (production, with authentication)
+
+**What is it?** A Gateway you created manually (from the MaaS blog post). It has Kuadrant AuthPolicy (requires API key) and RateLimitPolicy.
+
+**How to find the URL:**
+
+```bash
+oc get gateway maas-gateway -n openshift-ingress \
+  -o jsonpath='{.status.addresses[0].value}'
+```
+
+On our cluster:
+```
+a08cb63af408d4d8daab533606935da9-1640345712.ap-southeast-1.elb.amazonaws.com
+```
+
+**How to use it:**
+
+Same paths as `openshift-ai-inference`, but you need an API key:
+
+```bash
+export MAAS_GW=$(oc get gateway maas-gateway -n openshift-ingress \
+  -o jsonpath='{.status.addresses[0].value}')
+
+# This will return 401 Unauthorized (because no API key)
+curl -sk "https://$MAAS_GW/my-first-model/qwen3-0-6b/v1/models"
+
+# With API key (you need to set up Kuadrant auth first)
+curl -sk -H "Authorization: Bearer <your-api-key>" \
+  "https://$MAAS_GW/my-first-model/qwen3-0-6b/v1/models"
+```
+
+> **Note**: The EnvoyFilter body-forwarding fix currently only applies to `openshift-ai-inference`.
+> To fix POST requests on `maas-gateway` too, you need a second EnvoyFilter (see `manifests/08-envoyfilter-fix-extproc-body.yaml`).
+
+---
+
+#### Way 3: Direct to vLLM Service (bypasses Gateway AND EPP)
+
+**What is it?** You skip the Gateway entirely and talk directly to the vLLM Kubernetes Service from inside the cluster. No EPP smart routing, no Envoy, no authentication. Useful for debugging.
+
+**How to find the service:**
+
+```bash
+oc get svc -n my-first-model
+```
+
+On our cluster:
+```
+NAME                                    TYPE        CLUSTER-IP       PORT(S)
+qwen3-0-6b-kserve-workload-svc          ClusterIP   172.30.156.35    8000/TCP
+qwen3-0-6b-epp-service                  ClusterIP   172.30.187.192   9002/TCP,9003/TCP,9090/TCP
+qwen3-0-6b-inference-pool-ip-a5e07bf3   ClusterIP   None             54321/TCP
+```
+
+The service you want is `qwen3-0-6b-kserve-workload-svc` on port `8000`.
+
+**Important**: This service uses `appProtocol: https`, so you must use HTTPS even from inside the cluster.
+
+**How to use it (from inside the cluster only):**
+
+You can't reach a ClusterIP service from your laptop. You need to be inside a pod, or use `oc port-forward`, or run curl from a debug pod.
+
+```bash
+# Option A: Port-forward to your laptop
+oc port-forward svc/qwen3-0-6b-kserve-workload-svc 8000:8000 -n my-first-model &
+
+# Then curl localhost (note: HTTPS because the vLLM service requires it)
+curl -sk "https://localhost:8000/v1/models"
+curl -sk -X POST "https://localhost:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"Hi"}],"max_tokens":10}'
+
+# Don't forget to kill the port-forward when done
+kill %1
+```
+
+```bash
+# Option B: Run curl from inside the cluster (using a debug pod)
+oc run curl-test --rm -it --image=curlimages/curl --restart=Never -- \
+  curl -sk "https://qwen3-0-6b-kserve-workload-svc.my-first-model.svc.cluster.local:8000/v1/models"
+```
+
+**Key differences when going direct:**
+- No path prefix needed! It's just `/v1/models`, `/v1/chat/completions`, etc.
+  (The gateway strips the `/my-first-model/qwen3-0-6b` prefix before forwarding.
+   When you go direct, there's nothing to strip.)
+- No EPP routing -- Kubernetes round-robins to any vLLM pod
+- Must use HTTPS (vLLM has TLS enabled)
+- Only works from inside the cluster (ClusterIP is not reachable from outside)
+
+---
+
+#### Summary: All 3 Ways at a Glance
+
+```
+                                  ┌──────────────────────────────────┐
+YOUR LAPTOP                       │         YOUR CLUSTER             │
+                                  │                                  │
+Way 1: openshift-ai-inference     │                                  │
+  https://<elb-1>/my-first-model/ │   ┌──────────┐   ┌─────┐        │
+  qwen3-0-6b/v1/chat/completions ───> │ Gateway  │──>│ EPP │──┐     │
+  (no auth, for testing)          │   └──────────┘   └─────┘  │     │
+                                  │                            │     │
+Way 2: maas-gateway               │                            ▼     │
+  https://<elb-2>/my-first-model/ │   ┌──────────┐   ┌─────┐ ┌───┐  │
+  qwen3-0-6b/v1/chat/completions ───> │ Gateway  │──>│ EPP │─>│vLLM│ │
+  (needs API key)                 │   │ +AuthPol. │   └─────┘ │pods│ │
+                                  │   └──────────┘           └───┘  │
+Way 3: Direct (inside cluster)    │                            ▲     │
+  https://qwen3-0-6b-kserve-     │                            │     │
+  workload-svc:8000/              │   (no gateway, no EPP)     │     │
+  v1/chat/completions ─────────────────────────────────────────┘     │
+  (oc port-forward or from a pod) │                                  │
+                                  └──────────────────────────────────┘
+```
+
+| | Way 1: openshift-ai-inference | Way 2: maas-gateway | Way 3: Direct Service |
+|---|---|---|---|
+| **URL prefix** | `/my-first-model/qwen3-0-6b/v1/...` | `/my-first-model/qwen3-0-6b/v1/...` | `/v1/...` (no prefix!) |
+| **Protocol** | HTTPS | HTTPS | HTTPS |
+| **Auth needed?** | No | Yes (API key) | No |
+| **Goes through EPP?** | Yes (for completions) | Yes (for completions) | No (round-robin) |
+| **Reachable from laptop?** | Yes (ELB URL) | Yes (ELB URL) | No (need port-forward) |
+| **EnvoyFilter fix needed?** | Yes (applied) | Yes (not yet applied) | No (no Envoy involved) |
+| **Good for** | Quick testing | Production users | Debugging vLLM directly |
 
 ---
 
