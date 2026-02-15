@@ -26,16 +26,35 @@ layout: none
   <main>
     {{ content }}
   </main>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-  <script>
-    // Convert ```mermaid code blocks into rendered diagrams
-    document.querySelectorAll('pre code.language-mermaid').forEach(function(el) {
-      var container = document.createElement('div');
-      container.className = 'mermaid';
-      container.textContent = el.textContent;
-      el.parentElement.replaceWith(container);
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'neutral'
     });
-    mermaid.initialize({ startOnLoad: true });
+
+    // Find mermaid code blocks — kramdown uses different class formats
+    // Try: code.language-mermaid, code[class*="mermaid"], or check textContent
+    var codeBlocks = document.querySelectorAll('pre code');
+    codeBlocks.forEach(function(codeEl) {
+      var cls = codeEl.className || '';
+      var text = codeEl.textContent.trim();
+      var isMermaid = cls.indexOf('mermaid') !== -1 ||
+                      cls.indexOf('language-mermaid') !== -1 ||
+                      text.startsWith('%%{') ||
+                      text.startsWith('flowchart') ||
+                      text.startsWith('sequenceDiagram') ||
+                      text.startsWith('graph');
+      if (isMermaid) {
+        var container = document.createElement('div');
+        container.className = 'mermaid';
+        container.textContent = text;
+        codeEl.parentElement.replaceWith(container);
+      }
+    });
+
+    await mermaid.run();
   </script>
 </body>
 </html>

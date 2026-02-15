@@ -65,7 +65,6 @@ The second is User Workload Monitoring (UWM) Prometheus. It scrapes ServiceMonit
 Then there is Thanos Querier, which sits in front of both and gives you a single unified query endpoint. This is what Grafana needs to talk to.
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#e3f2fd', 'primaryTextColor': '#1a1a1a', 'primaryBorderColor': '#1565c0', 'lineColor': '#1565c0', 'secondaryColor': '#f3e5f5', 'tertiaryColor': '#e8f5e9', 'clusterBkg': '#fafafa', 'clusterBorder': '#90a4ae', 'edgeLabelBackground': '#ffffff', 'fontSize': '14px'}}}%%
 flowchart TD
     subgraph Sources["Metric Sources — namespace: my-first-model"]
         vLLM1["vLLM Pod 1<br/>port 8000 /metrics<br/>vllm:* metrics"]
