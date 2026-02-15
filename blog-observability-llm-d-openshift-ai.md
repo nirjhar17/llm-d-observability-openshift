@@ -1,3 +1,8 @@
+---
+layout: default
+title: How We Built an Observability Stack for llm-d on OpenShift AI
+---
+
 # How We Built an Observability Stack for llm-d on OpenShift AI — And Found a Bug Along the Way
 
 You've deployed a model on OpenShift AI using llm-d. It's running. You can curl it. But then you ask the obvious questions. How many requests is my model handling? What's my time-to-first-token? Is the KV cache filling up? Is the smart router actually distributing requests across replicas?
