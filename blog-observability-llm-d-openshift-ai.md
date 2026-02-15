@@ -65,32 +65,33 @@ The second is User Workload Monitoring (UWM) Prometheus. It scrapes ServiceMonit
 Then there is Thanos Querier, which sits in front of both and gives you a single unified query endpoint. This is what Grafana needs to talk to.
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#e3f2fd', 'primaryTextColor': '#1a1a1a', 'primaryBorderColor': '#1565c0', 'lineColor': '#1565c0', 'secondaryColor': '#f3e5f5', 'tertiaryColor': '#e8f5e9', 'clusterBkg': '#fafafa', 'clusterBorder': '#90a4ae', 'edgeLabelBackground': '#ffffff', 'fontSize': '14px'}}}%%
 flowchart TD
-    subgraph Sources["Metric Sources (namespace: my-first-model)"]
-        vLLM1["vLLM Pod 1\nport 8000 /metrics\nvllm:* metrics"]
-        vLLM2["vLLM Pod 2\nport 8000 /metrics\nvllm:* metrics"]
-        EPP["EPP Router Scheduler\nport 9090 /metrics\nepp_* metrics"]
+    subgraph Sources["Metric Sources — namespace: my-first-model"]
+        vLLM1["vLLM Pod 1<br/>port 8000 /metrics<br/>vllm:* metrics"]
+        vLLM2["vLLM Pod 2<br/>port 8000 /metrics<br/>vllm:* metrics"]
+        EPP["EPP Router Scheduler<br/>port 9090 /metrics<br/>epp_* metrics"]
     end
 
     subgraph Scraping["Who Scrapes What"]
-        PM["PodMonitor\nkserve-llm-isvc-vllm-engine\n(scrapes vLLM pods)"]
-        SM["ServiceMonitor\nkserve-llm-isvc-scheduler\n(scrapes EPP pod)"]
+        PM["PodMonitor<br/>kserve-llm-isvc-vllm-engine<br/>scrapes vLLM pods"]
+        SM["ServiceMonitor<br/>kserve-llm-isvc-scheduler<br/>scrapes EPP pod"]
     end
 
-    subgraph UWM["UWM Prometheus (openshift-user-workload-monitoring)"]
-        PUWM["prometheus-user-workload-0/1\nScrapes ServiceMonitors + PodMonitors\nHAS your vLLM + EPP metrics\n(adds kserve_ prefix)"]
+    subgraph UWM["UWM Prometheus — openshift-user-workload-monitoring"]
+        PUWM["prometheus-user-workload-0/1<br/>Scrapes ServiceMonitors + PodMonitors<br/>HAS vLLM + EPP metrics<br/>adds kserve_ prefix"]
     end
 
-    subgraph Platform["Platform Prometheus (openshift-monitoring)"]
-        PK["prometheus-k8s-0/1\nScrapes cluster infra, nodes,\nkubelets, etcd, API server\nDoes NOT scrape user workloads"]
+    subgraph Platform["Platform Prometheus — openshift-monitoring"]
+        PK["prometheus-k8s-0/1<br/>Scrapes nodes, kubelets, etcd, API server<br/>Does NOT scrape user workloads"]
     end
 
-    subgraph Thanos["Thanos Querier (openshift-monitoring)"]
-        TQ["thanos-querier\nFederates UWM + Platform Prometheus\nSingle endpoint with ALL metrics"]
+    subgraph Thanos["Thanos Querier — openshift-monitoring"]
+        TQ["thanos-querier<br/>Federates UWM + Platform Prometheus<br/>Single endpoint with ALL metrics"]
     end
 
-    subgraph Grafana["Grafana (llm-d-monitoring)"]
-        GR["Datasource: thanos-querier:9091\nDashboard 1: vLLM Latency, Throughput, Cache\nDashboard 2: EPP Routing and Pool Health"]
+    subgraph GrafanaBox["Grafana — llm-d-monitoring"]
+        GR["Datasource: thanos-querier:9091<br/>Dashboard 1: vLLM Latency, Throughput, Cache<br/>Dashboard 2: EPP Routing and Pool Health"]
     end
 
     vLLM1 --> PM

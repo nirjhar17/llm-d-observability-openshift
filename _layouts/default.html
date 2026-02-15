@@ -14,7 +14,8 @@ layout: none
     .site-header h1 { margin-bottom: 0.25rem; }
     .site-header p { color: #666; }
     pre { overflow-x: auto; }
-    .mermaid { background: white; text-align: center; padding: 1rem 0; }
+    .mermaid { background: white; text-align: center; padding: 1rem 0; overflow-x: auto; }
+    .mermaid svg { max-width: 100%; height: auto; }
   </style>
 </head>
 <body>
@@ -34,7 +35,7 @@ layout: none
       container.textContent = el.textContent;
       el.parentElement.replaceWith(container);
     });
-    mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    mermaid.initialize({ startOnLoad: true });
   </script>
 </body>
 </html>
