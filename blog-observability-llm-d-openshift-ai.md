@@ -219,7 +219,52 @@ The first is the vLLM Latency, Throughput, and Cache dashboard. It comes from th
 
 The second is the EPP Routing and Pool Health dashboard. This comes from the upstream Gateway API Inference Extension project. It shows request rate by model, routing decision duration, ready pod count, average KV cache utilization, and average queue size across the pool.
 
-Both dashboards are deployed as GrafanaDashboard Custom Resources backed by ConfigMaps. The setup script handles creating the ConfigMaps and applying the CRs.
+Both dashboards are deployed as GrafanaDashboard Custom Resources.
+
+Step 6: Deploy the EPP Routing and Pool Health dashboard. The Grafana Operator fetches the JSON directly from GitHub.
+
+```yaml
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: epp-routing-and-pool-health
+  namespace: llm-d-monitoring
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: llm-d-grafana
+  url: https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/refs/heads/main/tools/dashboards/inference_gateway.json
+```
+
+Step 7: Deploy the vLLM Latency, Throughput, and Cache dashboard. This one uses a ConfigMap because the original JSON needs a datasource variable replaced before loading.
+
+First, create the ConfigMap from the llm-d-deployer dashboard JSON:
+
+```
+git clone https://github.com/llm-d/llm-d-deployer.git
+sed 's/${DS_PROMETHEUS}/prometheus/g' \
+  llm-d-deployer/quickstart/grafana/dashboards/llm-d-dashboard.json | \
+  oc create configmap vllm-latency-throughput-and-cache-json \
+  --from-file=dashboard.json=/dev/stdin \
+  -n llm-d-monitoring
+```
+
+Then apply the GrafanaDashboard CR that references the ConfigMap:
+
+```yaml
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: vllm-latency-throughput-and-cache
+  namespace: llm-d-monitoring
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: llm-d-grafana
+  configMapRef:
+    name: vllm-latency-throughput-and-cache-json
+    key: dashboard.json
+```
 
 ## Generating Traffic and Lighting Up the Dashboards
 
