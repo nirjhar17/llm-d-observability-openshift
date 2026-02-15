@@ -3,13 +3,13 @@ layout: default
 title: How We Built an Observability Stack for llm-d on OpenShift AI
 ---
 
-# How We Built an Observability Stack for llm-d on OpenShift AI — And Found a Bug Along the Way
+# How We Built an Observability Stack for llm-d on OpenShift AI
 
 You've deployed a model on OpenShift AI using llm-d. It's running. You can curl it. But then you ask the obvious questions. How many requests is my model handling? What's my time-to-first-token? Is the KV cache filling up? Is the smart router actually distributing requests across replicas?
 
-The platform doesn't answer these out of the box. The metrics are there — vLLM and the EPP both expose Prometheus endpoints — but there's no dashboard to visualize them.
+The platform doesn't answer these out of the box. The metrics are there — vLLM and the EPP both expose Prometheus endpoints — but there are no dashboards to visualize them.
 
-This blog walks through everything we did to go from "no visibility" to "full Grafana dashboards showing every metric from the gateway to the model server." Along the way, we discovered a nasty bug where POST requests were silently broken.
+This blog walks through everything we did to go from "no visibility" to "full Grafana dashboards showing every metric from the gateway to the model server."
 
 ## What We're Working With
 
@@ -17,7 +17,40 @@ We're running on ROSA (Red Hat OpenShift on AWS) with OpenShift AI 3.2.0. The Is
 
 The LLMInferenceService operator automatically creates two vLLM pods (one per GPU), one EPP pod (the smart router), an InferencePool (groups the pods), and HTTPRoutes (URL routing rules).
 
-The intended request flow is straightforward: Client → AWS ELB → Envoy Gateway → EPP (picks best pod) → vLLM pod → Response.
+Here is how a request flows from you to the model:
+
+```
+YOU                     GATEWAY POD               EPP POD             vLLM POD
+ |                          |                        |                    |
+ |---POST /v1/chat/----->   |                        |                    |
+ |   completions            |                        |                    |
+ |   (with JSON body)       |                        |                    |
+ |                          |                        |                    |
+ |                     1. Receives your request      |                    |
+ |                     2. Matches the URL to an      |                    |
+ |                        HTTPRoute rule             |                    |
+ |                     3. Rule says: "this goes      |                    |
+ |                        to InferencePool"          |                    |
+ |                     4. Sends headers+body ------> |                    |
+ |                        to EPP via ext-proc        |                    |
+ |                                                   |                    |
+ |                                              5. EPP scores            |
+ |                                                 all vLLM pods         |
+ |                                              6. Picks the best one    |
+ |                                              7. Returns "use pod      |
+ |                     8. Receives EPP's  <------   10.128.16.25"        |
+ |                        decision                   |                    |
+ |                     9. Forwards the FULL          |                    |
+ |                        request (headers+body) -----------------------> |
+ |                                                                   10. vLLM runs
+ |                                                                       the model
+ |                                                                   11. Returns
+ |                     12. Forwards response <------------------------   tokens
+ | <---response------- back to you                                       |
+ |                          |                        |                    |
+```
+
+EPP scores every vLLM pod on three things and picks the one with the highest total score: queue depth (how many requests are waiting), KV cache usage (how full is GPU memory), and prefix cache (does this pod already have the prompt cached). Prefix cache gets the highest weight because a cache hit saves the most time.
 
 All good in theory. Now let's make it visible.
 
@@ -30,6 +63,52 @@ The first is Platform Prometheus. It scrapes cluster infrastructure — nodes, k
 The second is User Workload Monitoring (UWM) Prometheus. It scrapes ServiceMonitors and PodMonitors in user namespaces. This is where your vLLM and EPP metrics live.
 
 Then there is Thanos Querier, which sits in front of both and gives you a single unified query endpoint. This is what Grafana needs to talk to.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                     YOUR OPENSHIFT CLUSTER                           │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ namespace: my-first-model                                    │    │
+│  │                                                              │    │
+│  │  ┌────────────┐  ┌────────────┐  ┌──────────────────────┐   │    │
+│  │  │ vLLM Pod 1 │  │ vLLM Pod 2 │  │ EPP Pod              │   │    │
+│  │  │ (GPU node) │  │ (GPU node) │  │ (smart router)       │   │    │
+│  │  │ :8080 /metrics│ :8080 /metrics│ :9090 /metrics       │   │    │
+│  │  └─────┬──────┘  └─────┬──────┘  └──────────┬───────────┘   │    │
+│  │        │               │                     │               │    │
+│  │        └───────────────┼─────────────────────┘               │    │
+│  │                        │ scraped by ServiceMonitors          │    │
+│  └────────────────────────┼─────────────────────────────────────┘    │
+│                           ▼                                          │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ UWM Prometheus (openshift-user-workload-monitoring)          │    │
+│  │ Scrapes: vLLM metrics, EPP metrics                           │    │
+│  │ Adds "kserve_" prefix to all metric names                    │    │
+│  └──────────────────────────┬───────────────────────────────────┘    │
+│                              │                                       │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ Platform Prometheus (openshift-monitoring)                    │    │
+│  │ Scrapes: nodes, kubelets, API server, etcd                   │    │
+│  └──────────────────────────┬───────────────────────────────────┘    │
+│                              │                                       │
+│                              ▼                                       │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ THANOS QUERIER (openshift-monitoring)                        │    │
+│  │ Federates BOTH Prometheus instances                          │    │
+│  │ Single query endpoint for all metrics                        │    │
+│  └──────────────────────────┬───────────────────────────────────┘    │
+│                              │                                       │
+│                              ▼                                       │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │ GRAFANA (llm-d-monitoring)                                   │    │
+│  │ Datasource → Thanos Querier (via ServiceAccount token)       │    │
+│  │ Dashboard 1: vLLM Latency, Throughput, Cache (13 panels)     │    │
+│  │ Dashboard 2: EPP Routing and Pool Health                     │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 The key insight: you don't need to install Prometheus. It's already there. You just need Grafana to point to Thanos Querier with the right authentication.
 
