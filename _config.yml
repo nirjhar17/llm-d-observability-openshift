@@ -1,0 +1,3 @@
+theme: cayman
+title: llm-d Observability on OpenShift AI
+description: Grafana dashboards, metrics scraping, and bug fixes for llm-d inference on Red Hat OpenShift AI
