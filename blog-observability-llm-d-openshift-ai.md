@@ -64,50 +64,43 @@ The second is User Workload Monitoring (UWM) Prometheus. It scrapes ServiceMonit
 
 Then there is Thanos Querier, which sits in front of both and gives you a single unified query endpoint. This is what Grafana needs to talk to.
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                     YOUR OPENSHIFT CLUSTER                           │
-│                                                                      │
-│  ┌──────────────────────────────────────────────────────────────┐    │
-│  │ namespace: my-first-model                                    │    │
-│  │                                                              │    │
-│  │  ┌────────────┐  ┌────────────┐  ┌──────────────────────┐   │    │
-│  │  │ vLLM Pod 1 │  │ vLLM Pod 2 │  │ EPP Pod              │   │    │
-│  │  │ (GPU node) │  │ (GPU node) │  │ (smart router)       │   │    │
-│  │  │ :8080 /metrics│ :8080 /metrics│ :9090 /metrics       │   │    │
-│  │  └─────┬──────┘  └─────┬──────┘  └──────────┬───────────┘   │    │
-│  │        │               │                     │               │    │
-│  │        └───────────────┼─────────────────────┘               │    │
-│  │                        │ scraped by ServiceMonitors          │    │
-│  └────────────────────────┼─────────────────────────────────────┘    │
-│                           ▼                                          │
-│  ┌──────────────────────────────────────────────────────────────┐    │
-│  │ UWM Prometheus (openshift-user-workload-monitoring)          │    │
-│  │ Scrapes: vLLM metrics, EPP metrics                           │    │
-│  │ Adds "kserve_" prefix to all metric names                    │    │
-│  └──────────────────────────┬───────────────────────────────────┘    │
-│                              │                                       │
-│  ┌──────────────────────────────────────────────────────────────┐    │
-│  │ Platform Prometheus (openshift-monitoring)                    │    │
-│  │ Scrapes: nodes, kubelets, API server, etcd                   │    │
-│  └──────────────────────────┬───────────────────────────────────┘    │
-│                              │                                       │
-│                              ▼                                       │
-│  ┌──────────────────────────────────────────────────────────────┐    │
-│  │ THANOS QUERIER (openshift-monitoring)                        │    │
-│  │ Federates BOTH Prometheus instances                          │    │
-│  │ Single query endpoint for all metrics                        │    │
-│  └──────────────────────────┬───────────────────────────────────┘    │
-│                              │                                       │
-│                              ▼                                       │
-│  ┌──────────────────────────────────────────────────────────────┐    │
-│  │ GRAFANA (llm-d-monitoring)                                   │    │
-│  │ Datasource → Thanos Querier (via ServiceAccount token)       │    │
-│  │ Dashboard 1: vLLM Latency, Throughput, Cache (13 panels)     │    │
-│  │ Dashboard 2: EPP Routing and Pool Health                     │    │
-│  └──────────────────────────────────────────────────────────────┘    │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Sources["Metric Sources (namespace: my-first-model)"]
+        vLLM1["vLLM Pod 1\nport 8000 /metrics\nvllm:* metrics"]
+        vLLM2["vLLM Pod 2\nport 8000 /metrics\nvllm:* metrics"]
+        EPP["EPP Router Scheduler\nport 9090 /metrics\nepp_* metrics"]
+    end
+
+    subgraph Scraping["Who Scrapes What"]
+        PM["PodMonitor\nkserve-llm-isvc-vllm-engine\n(scrapes vLLM pods)"]
+        SM["ServiceMonitor\nkserve-llm-isvc-scheduler\n(scrapes EPP pod)"]
+    end
+
+    subgraph UWM["UWM Prometheus (openshift-user-workload-monitoring)"]
+        PUWM["prometheus-user-workload-0/1\nScrapes ServiceMonitors + PodMonitors\nHAS your vLLM + EPP metrics\n(adds kserve_ prefix)"]
+    end
+
+    subgraph Platform["Platform Prometheus (openshift-monitoring)"]
+        PK["prometheus-k8s-0/1\nScrapes cluster infra, nodes,\nkubelets, etcd, API server\nDoes NOT scrape user workloads"]
+    end
+
+    subgraph Thanos["Thanos Querier (openshift-monitoring)"]
+        TQ["thanos-querier\nFederates UWM + Platform Prometheus\nSingle endpoint with ALL metrics"]
+    end
+
+    subgraph Grafana["Grafana (llm-d-monitoring)"]
+        GR["Datasource: thanos-querier:9091\nDashboard 1: vLLM Latency, Throughput, Cache\nDashboard 2: EPP Routing and Pool Health"]
+    end
+
+    vLLM1 --> PM
+    vLLM2 --> PM
+    EPP --> SM
+    PM --> PUWM
+    SM --> PUWM
+    PUWM --> TQ
+    PK --> TQ
+    TQ --> GR
 ```
 
 The key insight: you don't need to install Prometheus. It's already there. You just need Grafana to point to Thanos Querier with the right authentication.

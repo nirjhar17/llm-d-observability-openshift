@@ -1,0 +1,40 @@
+---
+layout: none
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ page.title | default: site.title }}</title>
+  <link rel="stylesheet" href="https://unpkg.com/@picocss/pico@1/css/pico.min.css">
+  <style>
+    body { max-width: 900px; margin: 0 auto; padding: 2rem 1rem; }
+    .site-header { text-align: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid #ccc; }
+    .site-header h1 { margin-bottom: 0.25rem; }
+    .site-header p { color: #666; }
+    pre { overflow-x: auto; }
+    .mermaid { background: white; text-align: center; padding: 1rem 0; }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <h1><a href="{{ '/' | relative_url }}" style="text-decoration:none;color:inherit;">{{ site.title }}</a></h1>
+    <p>{{ site.description }}</p>
+  </header>
+  <main>
+    {{ content }}
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script>
+    // Convert ```mermaid code blocks into rendered diagrams
+    document.querySelectorAll('pre code.language-mermaid').forEach(function(el) {
+      var container = document.createElement('div');
+      container.className = 'mermaid';
+      container.textContent = el.textContent;
+      el.parentElement.replaceWith(container);
+    });
+    mermaid.initialize({ startOnLoad: true, theme: 'default' });
+  </script>
+</body>
+</html>
