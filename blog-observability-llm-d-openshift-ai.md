@@ -245,14 +245,6 @@ cd llm-d-observability-openshift
 
 You'll need an OpenShift cluster with RHOAI, a model deployed via LLMInferenceService, the Grafana Operator installed, and User Workload Monitoring enabled.
 
-## What's Next
-
-The natural next step is Prometheus alerting — for example, alerting when KV cache usage exceeds 80% or when error rates spike. The current EPP version doesn't emit all upstream metrics yet, so some dashboard panels remain empty, but that will improve as the project matures.
-
-If you're running llm-d on OpenShift AI, the metrics are already flowing. You just need to connect the dots. We hope this saves you the setup time.
-
-*All manifests, scripts, and guides are available at [github.com/nirjhar17/llm-d-observability-openshift](https://github.com/nirjhar17/llm-d-observability-openshift). Built on Red Hat OpenShift AI 3.2.0, ROSA ap-southeast-1.*
-
 ## About Me
 
 I work on OpenShift, OpenShift AI, and observability solutions, focusing on simplifying complex setups into practical, repeatable steps for platform and development teams.
