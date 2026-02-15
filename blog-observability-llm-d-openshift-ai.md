@@ -151,3 +151,15 @@ The natural next step is Prometheus alerting — for example, alerting when KV c
 If you're running llm-d on OpenShift AI, the metrics are already flowing. You just need to connect the dots. We hope this saves you the debugging time it cost us.
 
 *All manifests, scripts, and guides are available at [github.com/nirjhar17/llm-d-observability-openshift](https://github.com/nirjhar17/llm-d-observability-openshift). Built on Red Hat OpenShift AI 3.2.0, ROSA ap-southeast-1.*
+
+## About Me
+
+I work on OpenShift, OpenShift AI, and observability solutions, focusing on simplifying complex setups into practical, repeatable steps for platform and development teams.
+
+GitHub: [github.com/nirjhar17](https://github.com/nirjhar17)
+
+LinkedIn: [linkedin.com/in/nirjhar-jajodia](https://linkedin.com/in/nirjhar-jajodia)
+
+## Disclaimer
+
+The views and opinions expressed in this article are my own and do not necessarily reflect the official policy or position of my employer. This guide is provided for educational purposes, and I make no warranties about the completeness, reliability, or accuracy of this information.
