@@ -730,65 +730,175 @@ To check: `curl -sk "https://$GW/my-first-model/qwen3-0-6b/v1/models"`
 
 ---
 
-## 4. The Bug We Found and Fixed <a name="4-the-bug"></a>
+## 4. The Bugs We Found and Fixed <a name="4-the-bug"></a>
 
-### What Was Broken
+We found **four separate issues** that prevented EPP intelligent routing from working on RHOAI 3.2 with Istio 1.26.2. Each one had to be fixed in order — you could not skip ahead because the next issue only became visible after fixing the previous one.
 
-When you sent a POST request (chat completion) through the Gateway:
+### Bug 1: Request Body Disappearing (400 "body required")
 
-```
-What you sent:     {"model":"Qwen/Qwen3-0.6B", "messages":[...]}  (89 bytes)
-What Envoy got:    89 bytes (correct!)
-What vLLM got:     NOTHING (empty body!)
-What vLLM said:    400 "Field required" (because the body was empty)
-```
+**Symptom**: POST requests to `/v1/chat/completions` returned `400 "Field required"`.
 
-The request body (your JSON with the prompt) was disappearing somewhere between Envoy and vLLM.
+**Root cause**: Istio 1.26.2 set `request_body_mode` to `FULL_DUPLEX_STREAMED` for the ext-proc filter. In this mode, the body was sent to EPP but never forwarded to vLLM.
 
-### Why It Was Broken
-
-**The short version**: Istio 1.26.2 has a bug in how it handles request bodies when using the InferencePool/EPP feature.
-
-**The longer version**:
-
-When Envoy sends your request to EPP for routing decisions, it uses a feature called `ext-proc` (External Processing). This feature has a setting called `request_body_mode` that controls how the request body is handled:
-
-- `BUFFERED` = Send the whole body to EPP at once, then forward it to vLLM. **Simple and reliable.**
-- `FULL_DUPLEX_STREAMED` = Stream the body to EPP in chunks. **Complex and new.**
-
-Istio 1.26.2 was setting `FULL_DUPLEX_STREAMED` mode. In this mode, the body was being sent to EPP for processing, but **never forwarded to vLLM**. The body got "eaten" by the ext-proc filter.
-
-### How We Fixed It
-
-We applied an **EnvoyFilter** (a Kubernetes resource that patches Envoy's config) that changes the body mode from `FULL_DUPLEX_STREAMED` to `BUFFERED`:
+**Fix**: Applied an EnvoyFilter to change body mode to `STREAMED`:
 
 ```bash
 oc apply -f manifests/08-envoyfilter-fix-extproc-body.yaml
 ```
 
-That's it. One YAML file. The result:
+**Result**: `400 → 200 OK`. Requests started reaching vLLM. But we later discovered this EnvoyFilter was targeting `HTTP_ROUTE` level, which was not enough for EPP to actually work (see Bug 2).
 
+### Bug 2: EPP Never Contacted (dummy cluster)
+
+**Symptom**: Requests returned 200, but all 4 pods received exactly equal traffic (25/25/25/25). EPP scoring plugins had no effect. Changing scorer weights made no difference.
+
+**How we found it**: Checked Envoy proxy metrics for the EPP cluster:
+
+```bash
+ENVOY_POD=$(oc get pods -n openshift-ingress \
+  -l gateway.networking.k8s.io/gateway-name=openshift-ai-inference \
+  -o jsonpath='{.items[0].metadata.name}')
+
+oc exec -n openshift-ingress $ENVOY_POD -c istio-proxy -- \
+  pilot-agent request GET /clusters | grep "epp.*cx_total"
 ```
-BEFORE the fix:  POST /v1/chat/completions → 400 "body required"
-AFTER the fix:   POST /v1/chat/completions → 200 OK (model responds!)
+
+**The result was `cx_total: 0`**. Envoy had never even attempted to connect to EPP. Every request was going through Envoy's default round-robin.
+
+**Root cause**: When KServe creates the InferencePool and HTTPRoute, Istio registers a **base ext_proc HTTP filter** in the Gateway with:
+- `cluster_name: "dummy"`
+- `request_header_mode: SKIP`
+
+The SKIP setting meant the ext_proc filter was disabled at the base level. Our EnvoyFilter from Bug 1 was targeting `applyTo: HTTP_ROUTE` (per-route override), but the base filter's SKIP mode takes precedence — per-route overrides cannot un-SKIP a base filter.
+
+**Fix**: Changed the EnvoyFilter to target `applyTo: HTTP_FILTER` (base filter level) instead of `HTTP_ROUTE`, replacing the dummy cluster with the real EPP service:
+
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: fix-extproc-body-mode
+  namespace: openshift-ingress
+spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: openshift-ai-inference
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+            subFilter:
+              name: envoy.filters.http.ext_proc
+    patch:
+      operation: MERGE
+      value:
+        typed_config:
+          '@type': type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+          grpc_service:
+            envoy_grpc:
+              cluster_name: outbound|9002||qwen3-0-6b-epp-service.my-first-model.svc.cluster.local
+            timeout: 30s
+          failure_mode_allow: true
+          processing_mode:
+            request_header_mode: SEND
+            response_header_mode: SEND
+            request_body_mode: STREAMED
+          message_timeout: 30s
 ```
 
-### What We Tried First (That Didn't Work)
+**Result**: `cx_total` went from 0 to 5 (Envoy now connecting to EPP). But all 5 connections failed (see Bug 3).
 
-| Attempt | What Happened |
-|---------|--------------|
-| Upgrade Istio from 1.26.2 to 1.27.3 (which fixes the bug natively) | The Sail operator (Service Mesh 3) keeps reverting the version back to 1.26.2 within seconds |
-| Remove the ownership reference so the operator stops controlling it | Sail operator re-adds the ownership AND reverts the version |
-| Scale down the RHOAI operator, then upgrade | Sail operator (not RHOAI) is the one controlling the version, so RHOAI being down didn't help |
-| Upgrade RHOAI to a newer version | Already on latest (3.2.0), no newer version available |
+### Bug 3: TLS Handshake Failure (CERTIFICATE_VERIFY_FAILED)
 
-The EnvoyFilter was the only approach that worked because it patches Envoy directly without changing any operator-managed resources.
+**Symptom**: After Bug 2 fix, Envoy connected to EPP but every connection failed: `cx_connect_fail: 5, cx_total: 5`.
 
-### Is This Fix Permanent?
+**How we found it**: The DestinationRule for the EPP service expected a service-CA signed certificate (`mode: SIMPLE`, `caCertificates: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt`). But the EPP was presenting a self-signed certificate instead.
 
-- **Yes**, the EnvoyFilter persists across pod restarts and cluster reboots.
-- **When Istio is eventually upgraded to 1.27+** (in a future RHOAI release), this EnvoyFilter can be removed because 1.27 fixes the body forwarding natively.
-- The fix currently only applies to the `openshift-ai-inference` gateway. To also fix `maas-gateway`, apply a second EnvoyFilter (see the manifest file for instructions).
+**Root cause**: The EPP scheduler container had the TLS certificate mounted at `/var/run/kserve/tls` but was NOT told to use it. The `--cert-path` argument was missing from its startup args.
+
+**Fix**: Patched the LLMInferenceService to add TLS args to the scheduler container:
+
+```bash
+oc patch llminferenceservice qwen3-0-6b -n my-first-model --type='json' -p='[
+  {"op":"add","path":"/spec/router/scheduler/template/containers/0/args/-","value":"--secure-serving"},
+  {"op":"add","path":"/spec/router/scheduler/template/containers/0/args/-","value":"--cert-path"},
+  {"op":"add","path":"/spec/router/scheduler/template/containers/0/args/-","value":"/var/run/kserve/tls"}
+]'
+```
+
+**Result**: `cx_connect_fail: 0`. Requests returned HTTP 200 with `x-went-into-resp-headers: true` (EPP is in the loop). But distribution was still wrong (see Bug 4).
+
+### Bug 4: Wrong EndpointPickerConfig (no P/D awareness)
+
+**Symptom**: After Bug 3 fix, EPP was live but distribution was still near-equal across all 4 pods. Prefill and decode pods were treated identically.
+
+**Root cause**: The default EndpointPickerConfig used a single `default` scheduling profile with `queue-scorer`, `kv-cache-utilization-scorer`, and `prefix-cache-scorer`. This config treats all pods the same — it does not know about prefill vs decode roles. For P/D disaggregation, you need `pd-profile-handler` with separate `prefill` and `decode` profiles.
+
+**Fix**: Patched the LLMInferenceService to replace the EndpointPickerConfig:
+
+```yaml
+plugins:
+- type: prefill-header-handler
+- type: prefill-filter
+- type: decode-filter
+- type: max-score-picker
+- type: queue-scorer
+- type: prefix-cache-scorer
+- type: pd-profile-handler
+  parameters:
+    threshold: 0
+schedulingProfiles:
+- name: prefill
+  plugins:
+  - pluginRef: prefill-filter
+  - pluginRef: queue-scorer
+    weight: 1.0
+  - pluginRef: prefix-cache-scorer
+    weight: 3.0
+  - pluginRef: max-score-picker
+- name: decode
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: queue-scorer
+    weight: 1.0
+  - pluginRef: prefix-cache-scorer
+    weight: 3.0
+  - pluginRef: max-score-picker
+```
+
+Also added `--enable-prefix-caching --block-size=16` to vLLM's `VLLM_ADDITIONAL_ARGS` for both prefill and decode pods to enable Automatic Prefix Caching.
+
+**Result**: Distribution changed from 25/25/25/25 (round-robin) to true P/D routing. With 100 shared-prefix requests:
+- Prefill pods: 46 + 54 = 100 (all requests go through prefill first)
+- Decode pods: 100 + 0 = 100 (session affinity — warm cache pod gets everything)
+- Prefix cache hit rate: **86%** (close to the Red Hat blog's 87.4%)
+
+### Summary: The Four Fixes
+
+| Bug | Symptom | Root Cause | Fix |
+|-----|---------|------------|-----|
+| 1 | 400 "body required" | Body mode FULL_DUPLEX_STREAMED | EnvoyFilter: change to STREAMED |
+| 2 | EPP never contacted (cx_total: 0) | Base ext_proc filter = dummy/SKIP | EnvoyFilter: target HTTP_FILTER, replace dummy with real EPP |
+| 3 | TLS failure (cx_connect_fail: 100%) | Missing --cert-path on EPP | Patch LLMInferenceService: add --cert-path=/var/run/kserve/tls |
+| 4 | No P/D routing (equal distribution) | Wrong EndpointPickerConfig | Patch LLMInferenceService: pd-profile-handler + prefill/decode profiles |
+
+### Before and After
+
+| Phase | Pod Distribution | Cache Hits | EPP Status |
+|-------|-----------------|------------|------------|
+| Before all fixes | 25 / 25 / 25 / 25 | 0% | Dead (dummy cluster) |
+| After Bugs 1-3 fixed | Prefill 60/40, Decode 53/47 | 0% | Working (P/D routing) |
+| After all 4 bugs fixed | Prefill 46/54, Decode 100/0 | **86%** | Full (P/D + cache-aware + session affinity) |
+
+### Are These Fixes Permanent?
+
+- The **EnvoyFilter** persists across pod restarts. When RHOAI upgrades to a version where ext_proc is wired correctly by default, it can be removed.
+- The **LLMInferenceService patches** persist because they modify the CR spec directly. The KServe controller reconciles from the CR, so the scheduler deployment always gets the correct args.
+- The **prefix caching flags** (`--enable-prefix-caching`, `--block-size=16`) persist in the `VLLM_ADDITIONAL_ARGS` env var.
 
 ---
 
@@ -851,19 +961,82 @@ oc get pods -n my-first-model -l app.kubernetes.io/name=qwen3-0-6b
 
 Should show your replicas as `Running`.
 
-### Check 7: Is the EnvoyFilter applied?
+### Check 7: Is the EnvoyFilter applied AND targeting HTTP_FILTER?
 
 ```bash
 oc get envoyfilter -n openshift-ingress
 ```
 
-Should show `fix-extproc-body-mode`. If it's missing, re-apply it:
+Should show `fix-extproc-body-mode`. Verify it targets `HTTP_FILTER` (not `HTTP_ROUTE`):
 
 ```bash
-oc apply -f manifests/08-envoyfilter-fix-extproc-body.yaml
+oc get envoyfilter fix-extproc-body-mode -n openshift-ingress -o yaml | grep applyTo
 ```
 
-### Check 8: Quick end-to-end test
+Expected output: `applyTo: HTTP_FILTER`. If it says `HTTP_ROUTE`, the EnvoyFilter is not fixing the base ext_proc filter and EPP will not be contacted.
+
+### Check 8: Is Envoy actually connecting to EPP?
+
+This is the most important check for intelligent routing. If this fails, EPP is dead and traffic uses round-robin.
+
+```bash
+ENVOY_POD=$(oc get pods -n openshift-ingress \
+  -l gateway.networking.k8s.io/gateway-name=openshift-ai-inference \
+  -o jsonpath='{.items[0].metadata.name}')
+
+oc exec -n openshift-ingress $ENVOY_POD -c istio-proxy -- \
+  pilot-agent request GET /clusters | grep "epp-service"
+```
+
+Key metrics to look for:
+
+| Metric | Good | Bad | Meaning |
+|--------|------|-----|---------|
+| `cx_total` | > 0 | 0 | 0 = Envoy never tried to connect (dummy cluster, Bug 2) |
+| `cx_connect_fail` | 0 | > 0 | Connections attempted but TLS failed (Bug 3) |
+| `rq_total` | matches your request count | 0 | Requests sent through EPP |
+| `rq_error` | 0 | > 0 | EPP returned errors |
+
+### Check 9: Is the EPP using the correct TLS cert?
+
+```bash
+oc get pods -n my-first-model -l app=qwen3-0-6b-kserve-router-scheduler \
+  -o jsonpath='{.items[0].spec.containers[0].args}' | python3 -m json.tool
+```
+
+You should see `--cert-path`, `/var/run/kserve/tls`, and `--secure-serving` in the args. If missing, EPP presents a self-signed cert and Envoy will reject it.
+
+### Check 10: Is the EndpointPickerConfig correct for P/D?
+
+```bash
+oc get pods -n my-first-model -l app=qwen3-0-6b-kserve-router-scheduler \
+  -o jsonpath='{.items[0].spec.containers[0].args}' | python3 -m json.tool
+```
+
+Look for `pd-profile-handler`, `prefill-filter`, and `decode-filter` in the config. If you only see a single `default` profile with `queue-scorer`, the EPP is not P/D-aware.
+
+### Check 11: Is prefix caching enabled on vLLM?
+
+```bash
+oc get pods -n my-first-model -l serving.kserve.io/inferenceservice=qwen3-0-6b \
+  -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.containers[0].env}' | grep -o "enable-prefix-caching"
+```
+
+If no output, vLLM is running with prefix caching disabled (default). Add `--enable-prefix-caching --block-size=16` to `VLLM_ADDITIONAL_ARGS`.
+
+### Check 12: Verify prefix cache hits
+
+```bash
+# Pick a vLLM pod
+POD=$(oc get pods -n my-first-model -l serving.kserve.io/inferenceservice=qwen3-0-6b \
+  -o jsonpath='{.items[0].metadata.name}')
+
+oc exec -n my-first-model $POD -- curl -s localhost:8000/metrics | grep prefix_cache
+```
+
+Expected: `vllm:prefix_cache_hits_total` should be non-zero after sending shared-prefix requests.
+
+### Check 13: Quick end-to-end test
 
 ```bash
 export GW=$(oc get gateway openshift-ai-inference -n openshift-ingress \
@@ -880,6 +1053,7 @@ curl -sk -X POST "https://$GW/my-first-model/qwen3-0-6b/v1/chat/completions" \
 
 If the first works but the second gives `400 "body required"`, the EnvoyFilter is missing.
 If the second gives `404 "model does not exist"`, the model name is wrong (check `/v1/models` output).
+If it returns 200 but `x-went-into-resp-headers` header is missing, EPP is not in the loop.
 
 ### Check 9: The Envoy access log (most useful for debugging)
 
@@ -993,6 +1167,9 @@ LLMInferenceService (qwen3-0-6b)           <-- You create ONLY this
     |-- DestinationRule (x2)                           = TLS settings
 ```
 
-You don't need to create any of these manually. The only thing you might need to add manually is:
-- The **EnvoyFilter** (to fix the body-forwarding bug on Istio 1.26)
-- The **maas-gateway HTTPRoute** (if you want auth/rate-limiting via Kuadrant)
+You don't need to create any of these manually. However, on RHOAI 3.0–3.2 (Istio 1.26.x), you may need to manually:
+- Apply an **EnvoyFilter** (`applyTo: HTTP_FILTER`) to fix the ext_proc wiring (dummy cluster → real EPP)
+- Patch the **LLMInferenceService** to add `--cert-path=/var/run/kserve/tls` and `--secure-serving` to the scheduler
+- Patch the **LLMInferenceService** to use the correct P/D-aware `EndpointPickerConfig` with `pd-profile-handler`
+- Add `--enable-prefix-caching --block-size=16` to vLLM's `VLLM_ADDITIONAL_ARGS` for prefix cache hits
+- Optionally create a **maas-gateway HTTPRoute** (if you want auth/rate-limiting via Kuadrant)
